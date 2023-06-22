@@ -122,6 +122,11 @@ pub mod adaptor {
 
     use crate::application::DataDto;
 
+    pub trait InPort<I>: 'static + Sync + Send {
+        type Dto;
+        fn emit(&self, input: I) -> Self::Dto;
+    }
+
     pub trait OutPort<I>: 'static + Sync + Send {
         type ViewModel;
         fn emit(&self, input: I) -> Self::ViewModel;
@@ -154,12 +159,65 @@ pub mod adaptor {
     
     pub struct PresenterB;
     
-    impl OutPort<DataDto> for PresenterB {
-        type ViewModel = String;
-        fn emit(&self, input: DataDto) -> Self::ViewModel {
-            format!("{:?}", input)
+    impl OutPort<Result<DataDto, u64>> for PresenterB {
+        type ViewModel = Result<String, u64>;
+        fn emit(&self, input: Result<DataDto, u64>) -> Self::ViewModel {
+            match input {
+                Ok(input) => {
+                    Ok(format!("{:?}", input))
+                },
+                Err(code) => {
+                    Err(code)
+                }
+            }
         }
     }
+
+
+    pub struct _Controller<T, P, I, D, O> {
+        transformer: T,
+        presenter: P,
+        _in: PhantomData<I>,
+        _trans: PhantomData<D>,
+        _out: PhantomData<O>
+    }
+
+    impl<T, P, I, D, O> _Controller<T, P, I, D, O>
+        where T: InPort<I, Dto = D>,
+              P: OutPort<O>
+    {
+        pub fn new(transformer: T, presenter: P) -> Self {
+            Self { transformer, presenter, _in: PhantomData, _trans: PhantomData, _out: PhantomData }
+        }
+
+        pub fn transform(self, input: I) -> Transformed<T, P, I, D, O> {
+            Transformed { trans_input: self.transformer.emit(input), controller: self, _in: PhantomData, _out: PhantomData }
+        }
+
+        fn present(self) -> P {
+            self.presenter
+        }
+    }
+
+    pub struct Transformed<T, P, I, D, O> {
+        controller: _Controller<T, P, I, D, O>,
+        trans_input: D,
+        _in: PhantomData<I>,
+        _out: PhantomData<O>
+    }
+
+    impl<T, P, I, D, O> Transformed<T, P, I, D, O>
+        where T: InPort<I, Dto = D>,
+              P: OutPort<O>
+    {
+        pub async fn handle<F, Fut>(self, f: F) -> P::ViewModel
+            where F: FnOnce(D) -> Fut,
+                  Fut: IntoFuture<Output = O>
+        {
+            self.controller.present().emit(f(self.trans_input).await)
+        }
+    }
+
 
     pub struct Controller<P, D> {
         presenter: P,
@@ -198,7 +256,7 @@ pub mod adaptor {
 
 use std::future::IntoFuture;
 
-use adaptor::{Controller, PresenterA};
+use adaptor::{_Controller as ControllerA, Controller as ControllerB, InPort, PresenterA, PresenterB};
 use application::{DependOnCreateDataService, CreateDataService};
 use inject::Handler;
 
@@ -208,9 +266,22 @@ use crate::application::DataDto;
 async fn main() -> anyhow::Result<()> {
     let handler = Handler::init();
 
+    #[derive(Clone)]
     struct UserInputForm {
         pub id: String,
         pub name: String
+    }
+
+    pub struct TransformerA;
+
+    impl InPort<UserInputForm> for TransformerA {
+        type Dto = DataDto;
+        fn emit(&self, input: UserInputForm) -> Self::Dto {
+            Self::Dto {
+                id: input.id,
+                name: input.name
+            }
+        }
     }
 
     impl From<UserInputForm> for DataDto {
@@ -227,12 +298,41 @@ async fn main() -> anyhow::Result<()> {
         name: "test man".to_string()
     };
 
-    let controller = Controller::new(PresenterA)
-        .capture(input)
+    let res = ControllerA::new(TransformerA, PresenterA)
+        .transform(input.clone())
+        .handle(|input| async { // <- ここで型が推論される
+            handler.create_simple_data_service()
+                .create(input)
+                .await
+        }).await;
+    println!("{:?}", res);
+
+    let res = ControllerA::new(TransformerA, PresenterB)
+        .transform(input.clone())
         .handle(|input| async {
             handler.create_simple_data_service()
                 .create(input)
                 .await
         }).await;
+    println!("{:?}", res);
+
+    let res = ControllerB::new(PresenterA)
+        .capture(input.clone())
+        .handle(|input| async {
+            handler.create_simple_data_service()
+                .create(input) // <- ここで型が推論される
+                .await
+        }).await;
+    println!("{:?}", res);
+    
+    let res = ControllerB::new(PresenterB)
+        .capture(input)
+        .handle(|input| async {
+            handler.create_simple_data_service()
+                .create(input)
+                .await  
+        }).await;
+    println!("{:?}", res);
+
     Ok(())
 }
